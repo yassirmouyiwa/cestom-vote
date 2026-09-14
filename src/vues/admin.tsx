@@ -291,7 +291,7 @@ export const Membres: FC<{
         ))}
       </nav>
       <div class="defilant">
-        <table>
+        <table class="table-membres">
           <thead><tr><th>Membre</th><th>Code</th><th>État</th><th></th></tr></thead>
           <tbody>
             {p.membres.length === 0 && <tr><td colspan={4} class="vide">Aucun membre.</td></tr>}

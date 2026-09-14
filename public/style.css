@@ -333,6 +333,20 @@ td code { white-space: nowrap; font-weight: 700; }
 .etat-valide { background: var(--vert-clair); color: var(--vert-fonce); }
 .etat-rejete { background: var(--rouge-clair); color: #7d0a1d; }
 
+/* Sur téléphone, chaque membre devient une fiche : nom et code, état, puis actions. */
+@media (max-width: 620px) {
+  .table-membres thead { display: none; }
+  .table-membres, .table-membres tbody { display: block; }
+  .table-membres tr {
+    display: grid; grid-template-columns: 1fr auto; align-items: center; gap: .35rem .6rem;
+    padding: .8rem 0; border-bottom: 1px solid var(--bordure);
+  }
+  .table-membres td { display: block; padding: 0; border: 0; }
+  .table-membres td:nth-child(2) { text-align: right; }
+  .table-membres td:nth-child(n+3), .table-membres td.vide { grid-column: 1 / -1; }
+  .table-membres .actions-membre { justify-content: flex-start; }
+}
+
 @media (max-width: 520px) {
   .carte { padding: 1rem .9rem; }
   .chiffre strong { font-size: 1.2rem; }
