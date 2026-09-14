@@ -1,0 +1,12 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  // Doit correspondre au nom du Worker dans le tableau de bord Cloudflare.
+  "name": "cestom-vote",
+  "main": "src/index.tsx",
+  "compatibility_date": "2026-06-01",
+  "assets": { "directory": "./public" },
+  // Base de données et stockage des photos : créés automatiquement au premier déploiement.
+  "d1_databases": [{ "binding": "DB", "database_name": "cestom-vote" }],
+  "kv_namespaces": [{ "binding": "PHOTOS" }],
+  "observability": { "enabled": true }
+}

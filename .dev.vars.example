@@ -1,0 +1,3 @@
+# Copiez ce fichier en « .dev.vars » pour tester le site sur votre PC.
+ADMIN_PASSWORD=motdepasse-de-test
+SECRET_KEY=remplacez-par-une-longue-chaine-aleatoire
