@@ -5,8 +5,8 @@
   "main": "src/index.tsx",
   "compatibility_date": "2026-06-01",
   "assets": { "directory": "./public" },
-  // Base de données et stockage des photos : créés automatiquement au premier déploiement.
-  "d1_databases": [{ "binding": "DB", "database_name": "cestom-vote" }],
-  "kv_namespaces": [{ "binding": "PHOTOS" }],
+  // Base de données et stockage des photos créés au premier déploiement.
+  "d1_databases": [{ "binding": "DB", "database_name": "cestom-vote", "database_id": "e2bd732b-2b5e-4a3f-a70c-ca03062fbde8" }],
+  "kv_namespaces": [{ "binding": "PHOTOS", "id": "65df042ae17041a78d3ab118cbb29dc9" }],
   "observability": { "enabled": true }
 }
