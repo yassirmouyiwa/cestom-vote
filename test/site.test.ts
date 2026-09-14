@@ -1,6 +1,6 @@
 import { env, exports } from "cloudflare:workers";
 import { beforeEach, describe, expect, it } from "vitest";
-import { ESSAIS_MAX, candidaturesOuvertes, normaliserCode, normaliserTelephone } from "../src/db";
+import { ESSAIS_MAX, candidaturesOuvertes, normaliserCode, normaliserTelephone, telephoneValide } from "../src/db";
 import { dateEnFrancais, heureMaroc, instantMaroc } from "../src/heure";
 import { pourcent } from "../src/vues/commun";
 
@@ -104,10 +104,16 @@ async function preparer() {
   return { codes, ids };
 }
 
-async function voter(code: string, choix: Record<string, Champ>) {
-  expect((await votant.post("/code", { code })).headers.get("Location")).toBe("/bulletin");
-  expect(await (await votant.post("/bulletin", choix)).text()).toContain("Vérifiez votre vote");
-  return votant.post("/voter", choix);
+async function voter(code: string, choix: Record<string, Champ>, client = votant) {
+  expect((await client.post("/code", { code })).headers.get("Location")).toBe("/bulletin");
+  expect(await (await client.post("/bulletin", choix)).text()).toContain("Vérifiez votre vote");
+  return client.post("/voter", choix);
+}
+
+/** Inscrit un membre et renvoie le code affiché sur la page de confirmation. */
+async function inscrire(client: Client, nom: string, telephone: string): Promise<string> {
+  expect((await client.post("/inscription", { nom, telephone })).headers.get("Location")).toBe("/inscription/confirmee");
+  return /class="code-affiche">([A-Z0-9]{3}-[A-Z0-9]{3})</.exec(await client.page("/inscription/confirmee"))![1];
 }
 
 describe("vote", () => {
@@ -191,6 +197,117 @@ describe("vote", () => {
   });
 });
 
+describe("membres", () => {
+  it("un membre inscrit ne vote qu'après validation de son code par le comité", async () => {
+    const { ids } = await preparer();
+    const membre = new Client();
+    const code = await inscrire(membre, "Afi", "06 11 22 33 44");
+    expect(await sql("SELECT membre, telephone, statut FROM codes WHERE code = ?", code))
+      .toEqual([{ membre: "Afi", telephone: "212611223344", statut: "attente" }]);
+
+    await membre.post("/code", { code });
+    expect(await membre.page("/")).toContain("pas encore été validée");
+
+    const validation = await comite.post(`/admin/codes/${code}/statut`, { statut: "valide", retour: "/admin/codes?filtre=attente" });
+    expect(validation.headers.get("Location")).toBe("/admin/codes?filtre=attente");
+    await voter(code, { poste_SG: ids["Candidat Un"], poste_CC: "blanc" }, membre);
+    expect(await bulletins()).toBe(1);
+  });
+
+  it("affiche le code avec un lien WhatsApp, pour ce navigateur seulement", async () => {
+    const membre = new Client();
+    await membre.post("/inscription", { nom: "Kossi", telephone: "+228 90 12 34 56" });
+    const page = await membre.page("/inscription/confirmee");
+    expect(page).toContain("wa.me/22890123456?text=");
+    expect((await new Client().requete("/inscription/confirmee")).headers.get("Location")).toBe("/inscription");
+  });
+
+  it("n'inscrit un numéro qu'une fois, sans révéler le code existant", async () => {
+    const code = await inscrire(new Client(), "Kodjo", "0611223344");
+    const autre = new Client();
+    const reponse = await autre.post("/inscription", { nom: "Imposteur", telephone: "+212 6 11 22 33 44" });
+    const html = await reponse.text();
+    expect(html).toContain("déjà inscrit");
+    expect(html).not.toContain(code);
+    expect(await compter("codes")).toBe(1);
+
+    // Une inscription rejetée libère le numéro.
+    await connecterComite();
+    await comite.post(`/admin/codes/${code}/statut`, { statut: "rejete" });
+    await inscrire(autre, "Kodjo", "0611223344");
+    expect(await compter("codes", "WHERE statut = 'attente'")).toBe(1);
+  });
+
+  it("refuse un numéro sans indicatif ou un nom vide", async () => {
+    const reponse = await votant.post("/inscription", { nom: "Yao", telephone: "90 12 34 56" });
+    expect(await reponse.text()).toContain("indicatif");
+    await votant.post("/inscription", { nom: " ", telephone: "0611223344" });
+    expect(await compter("codes")).toBe(0);
+  });
+
+  it("ferme les inscriptions une fois le vote clôturé", async () => {
+    await preparer();
+    await comite.post("/admin/statut", { action: "cloturer" });
+    await votant.post("/inscription", { nom: "Retardataire", telephone: "0611223344" });
+    expect(await compter("codes", "WHERE membre = 'Retardataire'")).toBe(0);
+  });
+
+  it("code perdu : le comité remplace le code, l'ancien ne fonctionne plus", async () => {
+    const { codes, ids } = await preparer();
+    const ancien = codes[0];
+    const reponse = await comite.post(`/admin/codes/${ancien}/nouveau`, { retour: "/admin/codes" });
+    const location = reponse.headers.get("Location")!;
+    const nouveau = decodeURIComponent(location.split("q=")[1]);
+    expect(nouveau).toMatch(/^[A-Z0-9]{3}-[A-Z0-9]{3}$/);
+    expect(nouveau).not.toBe(ancien);
+    expect(await comite.page(location)).toContain(nouveau);
+
+    await votant.post("/code", { code: ancien });
+    expect(await votant.page("/")).toContain("Code inconnu");
+    await voter(nouveau, { poste_SG: ids["Candidat Un"], poste_CC: "blanc" });
+    expect(await bulletins()).toBe(1);
+
+    await comite.post(`/admin/codes/${nouveau}/nouveau`);
+    expect(await comite.page("/admin/codes")).toContain("déjà servi");
+  });
+
+  it("recherche et filtre les membres", async () => {
+    await connecterComite();
+    await inscrire(new Client(), "Essi Mensah", "+228 90 12 34 56");
+    await comite.post("/admin/codes/generer", { membres: "Kofi ; 0677889900" });
+
+    const parNom = await comite.page("/admin/codes?q=essi");
+    expect(parNom).toContain("Essi Mensah");
+    expect(parNom).not.toContain("Kofi");
+    const parNumero = await comite.page("/admin/codes?q=90 12 34");
+    expect(parNumero).toContain("Essi Mensah");
+    expect(parNumero).not.toContain("Kofi");
+    const aValider = await comite.page("/admin/codes?filtre=attente");
+    expect(aValider).toContain("Essi Mensah");
+    expect(aValider).not.toContain("Kofi");
+  });
+
+  it("affiche le WhatsApp du comité sur la page Code perdu", async () => {
+    await connecterComite();
+    await comite.post("/admin/parametres", { titre: "Élections", date_limite: "2099-12-31T23:59", whatsapp_comite: "06 55 44 33 22" });
+    expect(await votant.page("/code-perdu")).toContain("wa.me/212655443322?text=");
+  });
+
+  it("met à jour une base créée par la version précédente du site", async () => {
+    for (const table of ["parametres", "codes"]) await env.DB.prepare(`DROP TABLE ${table}`).run();
+    await env.DB.batch([
+      env.DB.prepare("CREATE TABLE parametres (cle TEXT PRIMARY KEY, valeur TEXT NOT NULL)"),
+      env.DB.prepare("INSERT INTO parametres (cle, valeur) VALUES ('statut', 'preparation'), ('date_limite', '2099-12-31T23:59')"),
+      env.DB.prepare(`CREATE TABLE codes (code TEXT PRIMARY KEY, membre TEXT NOT NULL DEFAULT '', telephone TEXT NOT NULL DEFAULT '',
+        cree_le TEXT NOT NULL, utilise_le TEXT, marque TEXT)`),
+      env.DB.prepare("INSERT INTO codes (code, membre, cree_le) VALUES ('ABC-DEF', 'Ancien', '2026-09-14')"),
+    ]);
+    await votant.page("/");
+    expect(await sql("SELECT statut FROM codes WHERE code = 'ABC-DEF'")).toEqual([{ statut: "valide" }]);
+    expect(await sql("SELECT valeur FROM parametres WHERE cle = 'version_schema'")).toEqual([{ valeur: "2" }]);
+  });
+});
+
 describe("comité", () => {
   it("protège l'espace du comité", async () => {
     expect((await comite.requete("/admin")).headers.get("Location")).toBe("/admin/connexion");
@@ -200,28 +317,29 @@ describe("comité", () => {
     expect(await statut()).toBe("preparation");
   });
 
-  it("n'ouvre le vote qu'avec des candidatures traitées et des codes", async () => {
+  it("n'ouvre le vote qu'avec des candidatures traitées et des membres validés", async () => {
     await deposer(votant, "SG", "Candidat Un", "0600000001");
     await connecterComite();
     await comite.post("/admin/statut", { action: "ouvrir" }); // candidature en attente
     expect(await statut()).toBe("preparation");
     const [{ id }] = await sql<{ id: number }>("SELECT id FROM candidats");
     await valider(id);
-    await comite.post("/admin/statut", { action: "ouvrir" }); // aucun code
+    await inscrire(new Client(), "Membre", "0611223344");
+    await comite.post("/admin/statut", { action: "ouvrir" }); // aucun membre validé
     expect(await statut()).toBe("preparation");
     await comite.post("/admin/codes/generer", { nombre: 3 });
     await comite.post("/admin/statut", { action: "ouvrir" });
     expect(await statut()).toBe("ouvert");
   });
 
-  it("exporte les codes en CSV lisible par Excel", async () => {
+  it("exporte les membres en CSV lisible par Excel", async () => {
     await preparer();
     const reponse = await comite.requete("/admin/codes.csv");
     const octets = new Uint8Array(await reponse.arrayBuffer());
     expect([...octets.slice(0, 3)]).toEqual([0xef, 0xbb, 0xbf]);
     const contenu = new TextDecoder().decode(octets);
-    expect(contenu).toContain("Code;Membre;Téléphone;A voté");
-    expect(contenu).toContain(";Ama;212612345678;non");
+    expect(contenu).toContain("Code;Membre;Téléphone;Statut;A voté");
+    expect(contenu).toContain(";Ama;212612345678;valide;non");
   });
 
   it("réinitialise l'élection, photos comprises", async () => {
@@ -285,6 +403,7 @@ describe("candidatures", () => {
   it("refuse les candidatures invalides et les doublons", async () => {
     await deposer(votant, "SG", "Candidat Un", "0600000001", { photo: [new Blob(["pas une image"]), "photo.jpg"] });
     await deposer(votant, "SG", "Candidat Un", "0600000001", { motivation: "Trop court" });
+    await deposer(votant, "SG", "Candidat Un", "90123456");
     await deposer(votant, "XX", "Candidat Un", "0600000001");
     expect(await compter("candidats")).toBe(0);
     expect(await photosStockees()).toBe(0);
@@ -319,6 +438,8 @@ describe("formats et heure du Maroc", () => {
     expect(normaliserCode("K7P-3X")).toBeNull();
     expect(normaliserTelephone("06 12 34 56 78")).toBe("212612345678");
     expect(normaliserTelephone("+228 90 12 34 56")).toBe("22890123456");
+    expect(telephoneValide(normaliserTelephone("06 12 34 56 78"))).toBe(true);
+    expect(telephoneValide(normaliserTelephone("90 12 34 56"))).toBe(false);
     expect(pourcent(50)).toBe("50 %");
     expect(pourcent(33.3)).toBe("33,3 %");
     expect(pourcent(0)).toBe("0 %");
@@ -331,7 +452,7 @@ describe("formats et heure du Maroc", () => {
     expect(dateEnFrancais(heureMaroc(limite))).toBe("dimanche 20 septembre 2026 à 23h59");
     expect(instantMaroc("2026-02-30T10:00")).toBeNull();
 
-    const parametres = { titre: "", statut: "preparation" as const, date_limite: "2026-09-20T23:59" };
+    const parametres = { titre: "", statut: "preparation" as const, date_limite: "2026-09-20T23:59", whatsapp_comite: "" };
     expect(candidaturesOuvertes(parametres, Date.UTC(2026, 8, 20, 23, 59, 30))).toBe(true);
     expect(candidaturesOuvertes(parametres, Date.UTC(2026, 8, 21, 0, 0, 0))).toBe(false);
   });

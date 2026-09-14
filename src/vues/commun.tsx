@@ -47,7 +47,7 @@ export const Page: FC<{ commun: Commun; titrePage?: string; children?: Child }> 
           <nav class="nav-admin">
             <a href="/admin">Tableau de bord</a>
             <a href="/admin/candidats">Candidatures</a>
-            <a href="/admin/codes">Codes</a>
+            <a href="/admin/codes">Membres</a>
             <form method="post" action="/admin/deconnexion">
               <ChampCsrf commun={commun} />
               <button class="lien">Déconnexion</button>
@@ -65,6 +65,7 @@ export const Page: FC<{ commun: Commun; titrePage?: string; children?: Child }> 
 
       <footer class="pied">
         CESTOM Tétouan · Vote anonyme ·{" "}
+        {commun.statut !== "clos" && <><a href="/inscription">Recevoir mon code</a> ·{" "}</>}
         {commun.candidaturesOuvertes && <><a href="/candidature">Candidater</a> ·{" "}</>}
         <a href="/resultats">Résultats</a> · <a href="/admin">Comité électoral</a>
       </footer>

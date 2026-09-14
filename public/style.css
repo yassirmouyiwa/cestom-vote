@@ -314,6 +314,25 @@ td code { white-space: nowrap; font-weight: 700; }
 .actions-ligne > * { margin-left: .8rem; }
 .actions-ligne form { display: inline; }
 
+/* Inscription des membres -------------------------------------------------- */
+.appels { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fit, minmax(270px, 1fr)); align-items: start; }
+.appels .appel { max-width: none; }
+.appels > .intro { align-self: center; }
+.liens-code { margin: .6rem 0 0; font-size: .9rem; }
+.etroite-large { max-width: 560px; margin-inline: auto; }
+.code-affiche {
+  display: inline-block; margin: .3rem 0 1.2rem; padding: .7rem 1.3rem; border-radius: 14px;
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; font-size: clamp(2rem, 9vw, 2.6rem);
+  font-weight: 800; letter-spacing: .12em; color: var(--vert-fonce); background: #fff; border: 2px dashed var(--vert);
+}
+.actions-centre { justify-content: center; }
+.recherche { display: flex; flex-wrap: wrap; gap: .5rem; margin-bottom: .6rem; }
+.recherche input { flex: 1 1 14rem; width: auto; }
+.actions-membre { display: flex; flex-wrap: wrap; justify-content: flex-end; align-items: center; gap: .4rem .9rem; }
+.actions-membre form { margin: 0; }
+.etat-valide { background: var(--vert-clair); color: var(--vert-fonce); }
+.etat-rejete { background: var(--rouge-clair); color: #7d0a1d; }
+
 @media (max-width: 520px) {
   .carte { padding: 1rem .9rem; }
   .chiffre strong { font-size: 1.2rem; }

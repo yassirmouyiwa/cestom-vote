@@ -12,6 +12,8 @@ export interface Session {
   csrf: string;
   admin?: boolean;
   code?: string;
+  // Code affiché au membre juste après son inscription, pendant une durée limitée.
+  inscription?: { code: string; nom: string; telephone: string; expire: number };
   messages?: [Categorie, string][];
 }
 

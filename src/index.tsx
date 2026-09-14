@@ -3,20 +3,23 @@ import { Hono, type Context } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { admin } from "./admin";
 import {
-  INTITULES, candidaturesOuvertes, chargerParametres, dateLimiteTexte, enregistrerVote, essaisBloques,
-  joursRestants, normaliserCode, normaliserTelephone, noterEchec, participation, postesAvecCandidats, resultats,
+  ERREUR_TELEPHONE, INTITULES, candidaturesOuvertes, chargerParametres, dateLimiteTexte, enregistrerVote,
+  essaisBloques, inscrireMembre, joursRestants, normaliserCode, normaliserTelephone, noterTentative, participation,
+  postesAvecCandidats, resultats, telephoneValide,
 } from "./db";
 import type { Candidat, CandidatPublic, Poste } from "./db";
 import { commun, ipClient, ligne, rendre, texte } from "./outils";
 import { FORMAT_NOM_PHOTO, PhotoInvalide, TAILLE_MAX_PHOTO, enregistrerPhoto } from "./photos";
 import { egaliteConstante, message, sessions } from "./session";
 import type { AppEnv } from "./types";
+import { CodePerdu, Inscription, InscriptionConfirmee } from "./vues/membres";
 import {
   Accueil, Bulletin, CandidatureEnvoyee, FormulaireCandidature, Merci, PageCandidat, Recapitulatif, Resultats,
 } from "./vues/publiques";
 
 const MOTIVATION_MIN = 20;
 const MOTIVATION_MAX = 1000;
+const DUREE_AFFICHAGE_CODE = 30 * 60_000;
 
 const app = new Hono<AppEnv>({ strict: false });
 
@@ -83,7 +86,7 @@ app.on(["GET", "POST"], "/candidature", async (c) => {
     const erreurs: string[] = [];
     if (!Object.hasOwn(INTITULES, donnees.poste)) erreurs.push("Choisissez le poste visé.");
     if (donnees.nom.length < 3) erreurs.push("Indiquez votre nom complet.");
-    if (donnees.telephone.length < 8) erreurs.push("Indiquez un numéro WhatsApp valide.");
+    if (!telephoneValide(donnees.telephone)) erreurs.push(ERREUR_TELEPHONE);
     if (donnees.motivation.length < MOTIVATION_MIN) erreurs.push("Rédigez votre motivation en quelques phrases.");
     if (!(photo instanceof File) || photo.size === 0) erreurs.push("Ajoutez votre photo.");
 
@@ -149,13 +152,77 @@ app.get("/photos/:nom", async (c) => {
   });
 });
 
+// --- Inscription des membres -------------------------------------------------
+
+app.on(["GET", "POST"], "/inscription", async (c) => {
+  const ouvertes = c.get("parametres").statut !== "clos";
+  let valeurs: Record<string, string> = {};
+
+  if (c.req.method === "POST") {
+    if (!ouvertes) {
+      message(c, "Le vote est terminé : les inscriptions sont closes.", "erreur");
+      return c.redirect("/inscription", 303);
+    }
+    const corps = await c.req.parseBody();
+    valeurs = { nom: texte(corps, "nom"), telephone: texte(corps, "telephone") };
+    const nom = ligne(valeurs.nom, 80);
+    const telephone = normaliserTelephone(valeurs.telephone);
+    const cleEssais = `inscription:${ipClient(c)}`;
+    const erreurs: string[] = [];
+    if (nom.length < 2) erreurs.push("Indiquez votre nom ou pseudo.");
+    if (!telephoneValide(telephone)) erreurs.push(ERREUR_TELEPHONE);
+    if (erreurs.length === 0 && await essaisBloques(c.env.DB, cleEssais)) {
+      erreurs.push("Trop d'inscriptions depuis cette connexion. Réessayez dans 15 minutes.");
+    }
+    if (erreurs.length === 0) {
+      await noterTentative(c.env.DB, cleEssais);
+      const code = await inscrireMembre(c.env.DB, nom, telephone);
+      if (code) {
+        c.get("session").inscription = { code, nom, telephone, expire: Date.now() + DUREE_AFFICHAGE_CODE };
+        return c.redirect("/inscription/confirmee", 303);
+      }
+      // Le code existant n'est jamais révélé : seul le comité peut le renvoyer.
+      erreurs.push("Ce numéro est déjà inscrit. Code perdu ? Écrivez au comité électoral depuis ce numéro.");
+    }
+    for (const erreur of erreurs) message(c, erreur, "erreur");
+  }
+  return rendre(c, <Inscription commun={commun(c)} ouvertes={ouvertes} valeurs={valeurs} />);
+});
+
+app.get("/inscription/confirmee", (c) => {
+  const session = c.get("session");
+  const inscription = session.inscription;
+  if (!inscription || inscription.expire < Date.now()) {
+    delete session.inscription;
+    return c.redirect("/inscription", 303);
+  }
+  const lienSite = new URL("/", c.req.url).href;
+  const texteMessage = `Mon code de vote personnel (${c.get("parametres").titre}) : *${inscription.code}*\n\n`
+    + `Site du vote : ${lienSite}\n\n`
+    + "À garder secret. Il ne sert qu'une fois, après validation de mon inscription par le comité électoral.";
+  return rendre(c, (
+    <InscriptionConfirmee commun={commun(c)} code={inscription.code} nom={inscription.nom}
+      lienWhatsapp={`https://wa.me/${inscription.telephone}?text=${encodeURIComponent(texteMessage)}`} />
+  ));
+});
+
+app.get("/code-perdu", (c) => {
+  const numero = c.get("parametres").whatsapp_comite;
+  const lienComite = numero
+    ? `https://wa.me/${numero}?text=${encodeURIComponent("Bonjour, j'ai perdu mon code de vote. Mon nom ou pseudo : ")}`
+    : "";
+  return rendre(c, <CodePerdu commun={commun(c)} lienComite={lienComite} />);
+});
+
 // --- Vote ----------------------------------------------------------------------
 
 /** Code de la session s'il permet encore de voter, sinon null. */
 async function codeValide(c: Context<AppEnv>): Promise<string | null> {
   const code = c.get("session").code;
   if (!code || c.get("parametres").statut !== "ouvert") return null;
-  const libre = await c.env.DB.prepare("SELECT 1 FROM codes WHERE code = ? AND utilise_le IS NULL").bind(code).first();
+  const libre = await c.env.DB
+    .prepare("SELECT 1 FROM codes WHERE code = ? AND utilise_le IS NULL AND statut = 'valide'")
+    .bind(code).first();
   return libre ? code : null;
 }
 
@@ -188,11 +255,20 @@ app.post("/code", async (c) => {
   }
   const code = normaliserCode(texte(await c.req.parseBody(), "code"));
   const ligneCode = code
-    ? await db.prepare("SELECT utilise_le FROM codes WHERE code = ?").bind(code).first<{ utilise_le: string | null }>()
+    ? await db.prepare("SELECT utilise_le, statut FROM codes WHERE code = ?").bind(code)
+      .first<{ utilise_le: string | null; statut: string }>()
     : null;
   if (!code || !ligneCode) {
-    await noterEchec(db, ip);
+    await noterTentative(db, ip);
     message(c, "Code inconnu. Vérifiez le code reçu (6 caractères, ex. : K7P-3XQ).", "erreur");
+    return c.redirect("/", 303);
+  }
+  if (ligneCode.statut === "attente") {
+    message(c, "Votre inscription n'a pas encore été validée par le comité électoral. Réessayez un peu plus tard.", "info");
+    return c.redirect("/", 303);
+  }
+  if (ligneCode.statut !== "valide") {
+    message(c, "Ce code n'est pas valable. Contactez le comité électoral.", "erreur");
     return c.redirect("/", 303);
   }
   if (ligneCode.utilise_le) {

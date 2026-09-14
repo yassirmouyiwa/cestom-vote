@@ -27,6 +27,9 @@ export const Accueil: FC<{
               autocapitalize="characters" maxlength={12} required />
             <button class="bouton bouton-large">Accéder au bulletin</button>
             <p class="aide">Votre vote est anonyme : personne ne peut savoir pour qui vous avez voté.</p>
+            <p class="liens-code">
+              <a href="/inscription">Pas encore de code ? Inscrivez-vous</a> · <a href="/code-perdu">Code perdu ?</a>
+            </p>
           </form>
         </>
       ) : commun.statut === "clos" ? (
@@ -34,18 +37,28 @@ export const Accueil: FC<{
           <p class="intro">Le vote est terminé. Merci à toutes et à tous pour votre participation !</p>
           <a class="bouton" href="/resultats">Voir les résultats</a>
         </>
-      ) : commun.candidaturesOuvertes ? (
-        <div class="carte appel">
-          <p class="appel-delai">
-            {joursRestants > 1 ? `Plus que ${joursRestants} jours pour candidater`
-              : joursRestants === 1 ? "Clôture des candidatures demain" : "Dernier jour pour candidater !"}
-          </p>
-          <h2>Les candidatures sont ouvertes</h2>
-          <p>Envie de vous engager pour la communauté ? Déposez votre candidature avant le <strong>{dateLimite}</strong>.</p>
-          <a class="bouton bouton-large" href="/candidature">Déposer ma candidature</a>
-        </div>
       ) : (
-        <p class="intro">Les candidatures sont closes. Découvrez les candidats ci-dessous ; chaque membre recevra son code de vote personnel sur WhatsApp.</p>
+        <div class="appels">
+          {commun.candidaturesOuvertes ? (
+            <div class="carte appel">
+              <p class="appel-delai">
+                {joursRestants > 1 ? `Plus que ${joursRestants} jours pour candidater`
+                  : joursRestants === 1 ? "Clôture des candidatures demain" : "Dernier jour pour candidater !"}
+              </p>
+              <h2>Les candidatures sont ouvertes</h2>
+              <p>Envie de vous engager pour la communauté ? Déposez votre candidature avant le <strong>{dateLimite}</strong>.</p>
+              <a class="bouton bouton-large" href="/candidature">Déposer ma candidature</a>
+            </div>
+          ) : (
+            <p class="intro">Les candidatures sont closes. Découvrez les candidats ci-dessous.</p>
+          )}
+          <div class="carte appel">
+            <h2>Inscrivez-vous pour voter</h2>
+            <p>Donnez votre nom ou pseudo et votre numéro WhatsApp : vous recevez aussitôt votre code de vote personnel, activé après vérification par le comité électoral.</p>
+            <a class="bouton bouton-large" href="/inscription">Recevoir mon code de vote</a>
+            <p class="liens-code"><a href="/code-perdu">Code perdu ?</a></p>
+          </div>
+        </div>
       )}
     </section>
 

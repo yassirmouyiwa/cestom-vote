@@ -1,15 +1,16 @@
 /** Espace du comité électoral. */
 import { Hono, type Context } from "hono";
 import {
-  POSTES, STATUTS_CANDIDATURE, creerCodes, dateLimiteTexte, definirParametre, essaisBloques, grouperParPoste,
-  nombreEnAttente, normaliserTelephone, noterEchec, participation, postesAvecCandidats,
+  ERREUR_TELEPHONE, POSTES, STATUTS_CANDIDATURE, creerCodes, dateLimiteTexte, definirParametre, essaisBloques,
+  grouperParPoste, nombreEnAttente, normaliserTelephone, noterTentative, participation, postesAvecCandidats,
+  remplacerCode, telephoneValide,
 } from "./db";
-import type { Candidat, Statut, StatutCandidature } from "./db";
+import type { Candidat, Statut, StatutCandidature, StatutInscription } from "./db";
 import { dateCourte, dateEnFrancais, heureMaroc, instantMaroc } from "./heure";
 import { commun, ipClient, ligne, rendre, texte } from "./outils";
 import { egaliteConstante, jeton, message } from "./session";
 import type { AppEnv } from "./types";
-import { Candidatures, Codes, Connexion, Tableau, type CandidatureAdmin } from "./vues/admin";
+import { Candidatures, Connexion, Membres, Tableau, type CandidatureAdmin } from "./vues/admin";
 
 export const admin = new Hono<AppEnv>({ strict: false });
 
@@ -40,7 +41,7 @@ admin.on(["GET", "POST"], "/connexion", async (c) => {
       c.set("session", { csrf: jeton(), admin: true });
       return c.redirect("/admin", 303);
     } else {
-      await noterEchec(c.env.DB, ip);
+      await noterTentative(c.env.DB, ip);
       message(c, "Mot de passe incorrect.", "erreur");
     }
   }
@@ -55,13 +56,16 @@ admin.post("/deconnexion", (c) => {
 admin.get("/", async (c) => {
   const db = c.env.DB;
   const parametres = c.get("parametres");
-  const [postes, chiffres, enAttente] = await Promise.all([postesAvecCandidats(db), participation(db), nombreEnAttente(db)]);
+  const [postes, chiffres, candidaturesEnAttente] = await Promise.all([
+    postesAvecCandidats(db), participation(db), nombreEnAttente(db),
+  ]);
   const pourvus = new Set(postes.map((p) => p.code));
   return rendre(c, (
     <Tableau commun={commun(c)} participation={chiffres} candidatsValides={postes.length > 0}
       postesVides={POSTES.filter(([code]) => !pourvus.has(code)).map(([, intitule]) => intitule)}
-      enAttente={enAttente} dateLimite={parametres.date_limite} dateLimiteTexte={dateLimiteTexte(parametres)}
-      heureMaroc={dateEnFrancais(heureMaroc(Date.now()))} />
+      candidaturesEnAttente={candidaturesEnAttente} dateLimite={parametres.date_limite}
+      dateLimiteTexte={dateLimiteTexte(parametres)} heureMaroc={dateEnFrancais(heureMaroc(Date.now()))}
+      whatsappComite={parametres.whatsapp_comite} />
   ));
 });
 
@@ -70,10 +74,17 @@ admin.post("/parametres", async (c) => {
   const corps = await c.req.parseBody();
   const titre = ligne(texte(corps, "titre"), 120);
   const limite = texte(corps, "date_limite").slice(0, 16); // « AAAA-MM-JJTHH:MM »
+  const whatsapp = normaliserTelephone(texte(corps, "whatsapp_comite"));
   if (!titre || instantMaroc(limite) === null) {
     message(c, "Indiquez un titre et une date limite valides.", "erreur");
+  } else if (whatsapp && !telephoneValide(whatsapp)) {
+    message(c, `Numéro WhatsApp du comité : ${ERREUR_TELEPHONE}`, "erreur");
   } else {
-    await db.batch([definirParametre(db, "titre", titre), definirParametre(db, "date_limite", limite)]);
+    await db.batch([
+      definirParametre(db, "titre", titre),
+      definirParametre(db, "date_limite", limite),
+      definirParametre(db, "whatsapp_comite", whatsapp),
+    ]);
     message(c, "Paramètres enregistrés.", "succes");
   }
   return c.redirect("/admin", 303);
@@ -90,7 +101,7 @@ admin.post("/statut", async (c) => {
   } else if (transition[1] === "ouvert" && (await postesAvecCandidats(db)).length === 0) {
     message(c, "Validez au moins une candidature avant d'ouvrir le vote.", "erreur");
   } else if (transition[1] === "ouvert" && (await participation(db)).inscrits === 0) {
-    message(c, "Générez les codes de vote avant d'ouvrir le vote.", "erreur");
+    message(c, "Validez au moins un membre (ou générez des codes) avant d'ouvrir le vote.", "erreur");
   } else {
     await definirParametre(db, "statut", transition[1]).run();
     message(c, transition[2], "succes");
@@ -164,12 +175,20 @@ admin.post("/candidats/:id{[0-9]+}/supprimer", async (c) => {
   return c.redirect("/admin/candidats", 303);
 });
 
-// --- Codes de vote -----------------------------------------------------------
+// --- Membres et codes de vote --------------------------------------------------
 
-type LigneCode = { code: string; membre: string; telephone: string; utilise_le: string | null };
+type LigneCode = { code: string; membre: string; telephone: string; statut: StatutInscription; utilise_le: string | null };
 
-const REQUETE_CODES = "SELECT code, membre, telephone, utilise_le FROM codes";
-const ORDRE_CODES = "ORDER BY membre = '', membre COLLATE NOCASE, cree_le";
+const REQUETE_CODES = "SELECT code, membre, telephone, statut, utilise_le FROM codes";
+const ORDRE_CODES = "ORDER BY statut = 'attente' DESC, membre = '', membre COLLATE NOCASE, cree_le";
+
+const FILTRES: Record<string, string> = {
+  attente: "statut = 'attente'",
+  valides: "statut = 'valide'",
+  "pas-vote": "statut = 'valide' AND utilise_le IS NULL",
+  votes: "utilise_le IS NOT NULL",
+  rejetes: "statut = 'rejete'",
+};
 
 function lienWhatsapp(ligneCode: LigneCode, titre: string, lien: string): string {
   const bonjour = ligneCode.membre ? `Bonjour ${ligneCode.membre} 👋` : "Bonjour 👋";
@@ -178,19 +197,38 @@ function lienWhatsapp(ligneCode: LigneCode, titre: string, lien: string): string
   return `https://wa.me/${ligneCode.telephone}?text=${encodeURIComponent(texteMessage)}`;
 }
 
+/** Page de la liste à laquelle revenir après une action (filtre et recherche conservés). */
+function retourListe(corps: Record<string, unknown>): string {
+  const retour = texte(corps, "retour");
+  return /^\/admin\/codes(\?\S*)?$/.test(retour) ? retour : "/admin/codes";
+}
+
 admin.get("/codes", async (c) => {
-  const filtre = c.req.query("filtre") ?? "tous";
-  const condition = filtre === "attente" ? "WHERE utilise_le IS NULL"
-    : filtre === "votes" ? "WHERE utilise_le IS NOT NULL" : "";
+  const demande = c.req.query("filtre") ?? "";
+  const filtre = Object.hasOwn(FILTRES, demande) ? demande : "tous";
+  const recherche = (c.req.query("q") ?? "").trim().slice(0, 60);
+
+  const conditions = filtre === "tous" ? [] : [FILTRES[filtre]];
+  const valeurs: string[] = [];
+  if (recherche) {
+    const chiffres = recherche.replace(/\D/g, "").replace(/^0+/, "");
+    const estNumero = /^[\d\s+().-]+$/.test(recherche) && chiffres.length >= 4;
+    conditions.push(estNumero ? "telephone LIKE ?" : "(membre LIKE ? OR code LIKE ?)");
+    valeurs.push(...(estNumero ? [`%${chiffres}%`] : [`%${recherche}%`, `%${recherche.toUpperCase()}%`]));
+  }
+  const requete = c.env.DB.prepare(
+    `${REQUETE_CODES} ${conditions.length ? `WHERE ${conditions.join(" AND ")}` : ""} ${ORDRE_CODES}`,
+  );
   const [{ results }, chiffres] = await Promise.all([
-    c.env.DB.prepare(`${REQUETE_CODES} ${condition} ${ORDRE_CODES}`).all<LigneCode>(),
+    (valeurs.length ? requete.bind(...valeurs) : requete).all<LigneCode>(),
     participation(c.env.DB),
   ]);
   const titre = c.get("parametres").titre;
   const lien = new URL("/", c.req.url).href;
   return rendre(c, (
-    <Codes commun={commun(c)} filtre={filtre} participation={chiffres}
-      codes={results.map((l) => ({ ...l, whatsapp: lienWhatsapp(l, titre, lien) }))} />
+    <Membres commun={commun(c)} filtre={filtre} recherche={recherche} participation={chiffres}
+      retour={`/admin/codes${new URL(c.req.url).search}`}
+      membres={results.map((l) => ({ ...l, whatsapp: lienWhatsapp(l, titre, lien) }))} />
   ));
 });
 
@@ -214,7 +252,7 @@ admin.post("/codes/generer", async (c) => {
   } else {
     try {
       await creerCodes(c.env.DB, tous);
-      message(c, `${tous.length} code(s) créé(s).`, "succes");
+      message(c, `${tous.length} code(s) créé(s) et validé(s).`, "succes");
     } catch (erreur) {
       console.error(erreur);
       message(c, "La création des codes a échoué : réessayez.", "erreur");
@@ -223,7 +261,34 @@ admin.post("/codes/generer", async (c) => {
   return c.redirect("/admin/codes", 303);
 });
 
+admin.post("/codes/:code{[A-Z0-9-]+}/statut", async (c) => {
+  const corps = await c.req.parseBody();
+  const statut = texte(corps, "statut");
+  if (statut === "valide" || statut === "rejete") {
+    const modifie = await c.env.DB
+      .prepare("UPDATE codes SET statut = ? WHERE code = ? AND utilise_le IS NULL RETURNING membre")
+      .bind(statut, c.req.param("code")).first<{ membre: string }>();
+    if (modifie) {
+      const nom = modifie.membre || c.req.param("code");
+      message(c, `${nom} : inscription ${statut === "valide" ? "validée" : "rejetée"}.`, "succes");
+    }
+  }
+  return c.redirect(retourListe(corps), 303);
+});
+
+admin.post("/codes/:code{[A-Z0-9-]+}/nouveau", async (c) => {
+  const corps = await c.req.parseBody();
+  const nouveau = await remplacerCode(c.env.DB, c.req.param("code"));
+  if (!nouveau) {
+    message(c, "Ce code a déjà servi : il ne peut pas être remplacé.", "erreur");
+    return c.redirect(retourListe(corps), 303);
+  }
+  message(c, `Nouveau code : ${nouveau}. L'ancien ne fonctionne plus ; envoyez le nouveau avec le bouton WhatsApp.`, "succes");
+  return c.redirect(`/admin/codes?q=${encodeURIComponent(nouveau)}`, 303);
+});
+
 admin.post("/codes/:code{[A-Z0-9-]+}/supprimer", async (c) => {
+  const corps = await c.req.parseBody();
   const code = c.req.param("code");
   const { meta } = await c.env.DB.prepare("DELETE FROM codes WHERE code = ? AND utilise_le IS NULL").bind(code).run();
   if (meta.changes) {
@@ -231,19 +296,20 @@ admin.post("/codes/:code{[A-Z0-9-]+}/supprimer", async (c) => {
   } else {
     message(c, "Ce code a déjà servi : il ne peut pas être supprimé.", "erreur");
   }
-  return c.redirect("/admin/codes", 303);
+  return c.redirect(retourListe(corps), 303);
 });
 
 admin.get("/codes.csv", async (c) => {
   const { results } = await c.env.DB.prepare(`${REQUETE_CODES} ${ORDRE_CODES}`).all<LigneCode>();
   const cellule = (valeur: string) => (/[;"\r\n]/.test(valeur) ? `"${valeur.replace(/"/g, '""')}"` : valeur);
   const lignes = [
-    ["Code", "Membre", "Téléphone", "A voté"],
-    ...results.map((l) => [l.code, l.membre, l.telephone, l.utilise_le ? "oui" : "non"]),
+    ["Code", "Membre", "Téléphone", "Statut", "A voté"],
+    ...results.map((l) => [l.code, l.membre, l.telephone, l.statut, l.utilise_le ? "oui" : "non"]),
   ];
-  const csv = "\ufeff" + lignes.map((l) => l.map(cellule).join(";")).join("\r\n") + "\r\n"; // BOM : accents corrects dans Excel
+  const bom = String.fromCharCode(0xfeff); // accents corrects dans Excel
+  const csv = bom + lignes.map((l) => l.map(cellule).join(";")).join("\r\n") + "\r\n";
   return c.body(csv, 200, {
     "Content-Type": "text/csv; charset=utf-8",
-    "Content-Disposition": "attachment; filename=codes-vote.csv",
+    "Content-Disposition": "attachment; filename=membres-vote.csv",
   });
 });

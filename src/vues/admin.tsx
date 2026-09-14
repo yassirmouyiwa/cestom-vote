@@ -1,12 +1,22 @@
 /** Pages de l'espace du comité électoral. */
 import type { FC } from "hono/jsx";
-import { STATUTS_CANDIDATURE } from "../db";
-import type { Candidat, Poste, StatutCandidature } from "../db";
+import { STATUTS_CANDIDATURE, STATUTS_INSCRIPTION } from "../db";
+import type { Candidat, Poste, StatutCandidature, StatutInscription } from "../db";
 import { ChampCsrf, Page, Portrait, pourcent, type Commun } from "./commun";
 
-type Participation = { inscrits: number; votants: number; taux: number };
+type Participation = { inscrits: number; votants: number; taux: number; enAttente: number };
 export type CandidatureAdmin = Candidat & { depose: string };
-export type CodeAdmin = { code: string; membre: string; telephone: string; utilise_le: string | null; whatsapp: string };
+export type MembreAdmin = {
+  code: string;
+  membre: string;
+  telephone: string;
+  statut: StatutInscription;
+  utilise_le: string | null;
+  whatsapp: string;
+};
+
+/** Attribut onsubmit demandant confirmation (texte échappé pour JavaScript). */
+const confirmer = (texte: string) => `return confirm(${JSON.stringify(texte)})`;
 
 export const Connexion: FC<{ commun: Commun; configure: boolean }> = ({ commun, configure }) => (
   <Page commun={commun} titrePage="Comité électoral">
@@ -29,7 +39,7 @@ export const Connexion: FC<{ commun: Commun; configure: boolean }> = ({ commun, 
 );
 
 const BoutonStatut: FC<{ commun: Commun; action: string; classe: string; confirmation: string; libelle: string }> = (p) => (
-  <form method="post" action="/admin/statut" onsubmit={`return confirm('${p.confirmation}')`}>
+  <form method="post" action="/admin/statut" onsubmit={confirmer(p.confirmation)}>
     <ChampCsrf commun={p.commun} />
     <button class={p.classe} name="action" value={p.action}>{p.libelle}</button>
   </form>
@@ -40,10 +50,11 @@ export const Tableau: FC<{
   participation: Participation;
   candidatsValides: boolean;
   postesVides: string[];
-  enAttente: number;
+  candidaturesEnAttente: number;
   dateLimite: string;
   dateLimiteTexte: string;
   heureMaroc: string;
+  whatsappComite: string;
 }> = (p) => (
   <Page commun={p.commun} titrePage="Tableau de bord">
     <h1>Tableau de bord</h1>
@@ -51,23 +62,30 @@ export const Tableau: FC<{
     <section class="carte">
       <h2>{p.commun.libelleStatut}</h2>
 
+      {p.commun.statut !== "clos" && p.participation.enAttente > 0 && (
+        <p class="alerte alerte-info">
+          {p.participation.enAttente} inscription(s) de membres à valider. <a href="/admin/codes?filtre=attente">Les examiner</a>
+        </p>
+      )}
+
       {p.commun.statut === "preparation" ? (
         <>
           <ol class="etapes">
-            <li class={p.candidatsValides && !p.enAttente && !p.commun.candidaturesOuvertes ? "fait" : ""}>
+            <li class={p.candidatsValides && !p.candidaturesEnAttente && !p.commun.candidaturesOuvertes ? "fait" : ""}>
               <a href="/admin/candidats">Recevoir et valider les candidatures</a>
               <small>
                 {p.commun.candidaturesOuvertes ? `Ouvertes jusqu'au ${p.dateLimiteTexte}` : `Closes depuis le ${p.dateLimiteTexte}`}
               </small>
             </li>
-            <li class={p.participation.inscrits ? "fait" : ""}>
-              <a href="/admin/codes">Générer et envoyer les codes de vote</a>
+            <li class={p.participation.inscrits && !p.participation.enAttente ? "fait" : ""}>
+              <a href="/admin/codes">Valider les inscriptions des membres</a>
+              <small>{p.participation.inscrits} membre(s) validé(s) · {p.participation.enAttente} à valider</small>
             </li>
             <li>Le jour du vote : ouvrir le vote</li>
           </ol>
-          {p.enAttente > 0 && (
+          {p.candidaturesEnAttente > 0 && (
             <p class="alerte alerte-info">
-              {p.enAttente} candidature(s) en attente de validation. <a href="/admin/candidats">Les examiner</a>
+              {p.candidaturesEnAttente} candidature(s) en attente de validation. <a href="/admin/candidats">Les examiner</a>
             </p>
           )}
           {p.postesVides.length > 0 && (
@@ -80,7 +98,7 @@ export const Tableau: FC<{
         <>
           <div class="chiffres">
             <div class="chiffre"><strong>{p.participation.votants}</strong><span>ont voté</span></div>
-            <div class="chiffre"><strong>{p.participation.inscrits - p.participation.votants}</strong><span>en attente</span></div>
+            <div class="chiffre"><strong>{p.participation.inscrits - p.participation.votants}</strong><span>pas encore voté</span></div>
             <div class="chiffre"><strong>{pourcent(p.participation.taux)}</strong><span>participation</span></div>
           </div>
           <div class="barre"><span style={`width: ${p.participation.taux}%`}></span></div>
@@ -110,6 +128,10 @@ export const Tableau: FC<{
         <label for="date_limite">Date limite des candidatures <small>(heure du Maroc)</small></label>
         <input id="date_limite" name="date_limite" type="datetime-local" value={p.dateLimite} required />
         <p class="aide">Heure actuelle au Maroc : {p.heureMaroc}.</p>
+        <label for="whatsapp_comite">Numéro WhatsApp du comité <small>(facultatif)</small></label>
+        <input id="whatsapp_comite" name="whatsapp_comite" type="tel" inputmode="tel" placeholder="06 12 34 56 78"
+          value={p.whatsappComite ? `+${p.whatsappComite}` : ""} />
+        <p class="aide">Affiché sur la page « Code perdu » pour que les membres puissent écrire au comité.</p>
         <button class="bouton bouton-secondaire">Enregistrer</button>
       </form>
     </section>
@@ -117,7 +139,7 @@ export const Tableau: FC<{
     {p.commun.statut !== "ouvert" && (
       <section class="carte zone-danger">
         <h2>Préparer une nouvelle élection</h2>
-        <p>Supprime les candidatures (et leurs photos), les codes et les bulletins. Gardez une copie des résultats (capture d'écran ou impression) avant de continuer.</p>
+        <p>Supprime les candidatures (et leurs photos), les membres inscrits, leurs codes et les bulletins. Gardez une copie des résultats (capture d'écran ou impression) avant de continuer.</p>
         <form method="post" action="/admin/reinitialiser" class="formulaire en-ligne">
           <ChampCsrf commun={p.commun} />
           <input name="confirmation" placeholder="Tapez REINITIALISER" autocomplete="off" aria-label="Confirmation" />
@@ -192,7 +214,7 @@ export const Candidatures: FC<{
                     </form>
                   )}
                   <form method="post" action={`/admin/candidats/${c.id}/supprimer`}
-                    onsubmit="return confirm('Supprimer définitivement cette candidature et sa photo ?')">
+                    onsubmit={confirmer("Supprimer définitivement cette candidature et sa photo ?")}>
                     <ChampCsrf commun={commun} />
                     <button class="lien lien-danger">Supprimer</button>
                   </form>
@@ -206,59 +228,105 @@ export const Candidatures: FC<{
   </Page>
 );
 
-export const Codes: FC<{
+const ActionMembre: FC<{
   commun: Commun;
-  codes: CodeAdmin[];
-  filtre: string;
-  participation: Participation;
-}> = ({ commun, codes, filtre, participation }) => (
-  <Page commun={commun} titrePage="Codes de vote">
-    <h1>Codes de vote</h1>
+  code: string;
+  action: "statut" | "nouveau" | "supprimer";
+  retour: string;
+  libelle: string;
+  classe: string;
+  statut?: StatutInscription;
+  confirmation?: string;
+}> = (p) => (
+  <form method="post" action={`/admin/codes/${p.code}/${p.action}`}
+    onsubmit={p.confirmation ? confirmer(p.confirmation) : undefined}>
+    <ChampCsrf commun={p.commun} />
+    <input type="hidden" name="retour" value={p.retour} />
+    {p.statut && <input type="hidden" name="statut" value={p.statut} />}
+    <button class={p.classe}>{p.libelle}</button>
+  </form>
+);
 
-    {commun.statut !== "clos" && (
-      <section class="carte">
-        <h2>Générer des codes</h2>
-        <form method="post" action="/admin/codes/generer" class="formulaire">
-          <ChampCsrf commun={commun} />
-          <label for="membres">Membres <small>(un par ligne : Nom ; téléphone facultatif)</small></label>
-          <textarea id="membres" name="membres" rows={6}
-            placeholder={"Prénom NOM ; 06 12 34 56 78\nPrénom NOM ; +228 90 12 34 56\nPrénom NOM"}></textarea>
-          <label for="nombre">Ou nombre de codes sans nom</label>
-          <input id="nombre" name="nombre" type="number" min="0" max="500" inputmode="numeric" placeholder="0" />
-          <button class="bouton">Générer</button>
-        </form>
-      </section>
-    )}
+const FILTRES_MEMBRES = [
+  ["tous", "Tous"],
+  ["attente", "À valider"],
+  ["valides", "Validés"],
+  ["pas-vote", "Pas encore voté"],
+  ["votes", "Ont voté"],
+  ["rejetes", "Rejetés"],
+];
+
+export const Membres: FC<{
+  commun: Commun;
+  membres: MembreAdmin[];
+  filtre: string;
+  recherche: string;
+  retour: string;
+  participation: Participation;
+}> = (p) => (
+  <Page commun={p.commun} titrePage="Membres et codes">
+    <h1>Membres et codes</h1>
+    <div class="chiffres">
+      <div class="chiffre"><strong>{p.participation.enAttente}</strong><span>à valider</span></div>
+      <div class="chiffre"><strong>{p.participation.inscrits}</strong><span>validés</span></div>
+      <div class="chiffre"><strong>{p.participation.votants}</strong><span>ont voté</span></div>
+    </div>
+    <p class="aide aide-section">
+      Les membres s'inscrivent eux-mêmes sur <a href="/inscription">la page d'inscription</a> et reçoivent aussitôt leur code.
+      Vérifiez que chaque inscription correspond à un vrai membre avant de la valider : seuls les codes validés permettent de voter.
+      Code perdu : quand le membre vous écrit depuis son numéro inscrit, recherchez-le et renvoyez son code sur WhatsApp,
+      ou créez-en un nouveau.
+    </p>
 
     <section class="carte">
-      <div class="titre-section">
-        <h2>{participation.inscrits} code(s) · {participation.votants} vote(s)</h2>
-        <a class="bouton bouton-secondaire" href="/admin/codes.csv">Exporter (CSV)</a>
-      </div>
+      <form method="get" action="/admin/codes" class="recherche">
+        {p.filtre !== "tous" && <input type="hidden" name="filtre" value={p.filtre} />}
+        <input name="q" type="search" value={p.recherche} placeholder="Nom, numéro ou code" aria-label="Rechercher un membre" />
+        <button class="bouton bouton-secondaire">Rechercher</button>
+      </form>
       <nav class="filtres">
-        <a href="/admin/codes" aria-current={filtre !== "attente" && filtre !== "votes" ? "page" : undefined}>Tous</a>
-        <a href="/admin/codes?filtre=attente" aria-current={filtre === "attente" ? "page" : undefined}>Pas encore voté</a>
-        <a href="/admin/codes?filtre=votes" aria-current={filtre === "votes" ? "page" : undefined}>Ont voté</a>
+        {FILTRES_MEMBRES.map(([cle, libelle]) => (
+          <a href={cle === "tous" ? "/admin/codes" : `/admin/codes?filtre=${cle}`}
+            aria-current={p.filtre === cle ? "page" : undefined}>{libelle}</a>
+        ))}
       </nav>
       <div class="defilant">
         <table>
-          <thead><tr><th>Code</th><th>Membre</th><th>État</th><th></th></tr></thead>
+          <thead><tr><th>Membre</th><th>Code</th><th>État</th><th></th></tr></thead>
           <tbody>
-            {codes.length === 0 && <tr><td colspan={4} class="vide">Aucun code.</td></tr>}
-            {codes.map((c) => (
+            {p.membres.length === 0 && <tr><td colspan={4} class="vide">Aucun membre.</td></tr>}
+            {p.membres.map((m) => (
               <tr>
-                <td><code>{c.code}</code></td>
-                <td>{c.membre || "—"}{c.telephone && <small>+{c.telephone}</small>}</td>
-                <td>{c.utilise_le ? <span class="etat etat-vote">A voté</span> : <span class="etat">En attente</span>}</td>
-                <td class="actions-ligne">
-                  {!c.utilise_le && (
-                    <>
-                      <a class="lien" href={c.whatsapp} target="_blank" rel="noopener">WhatsApp</a>
-                      <form method="post" action={`/admin/codes/${c.code}/supprimer`} onsubmit="return confirm('Supprimer ce code ?')">
-                        <ChampCsrf commun={commun} />
-                        <button class="lien lien-danger">Supprimer</button>
-                      </form>
-                    </>
+                <td>{m.membre || "—"}{m.telephone && <small>+{m.telephone}</small>}</td>
+                <td><code>{m.code}</code></td>
+                <td>
+                  {m.utilise_le
+                    ? <span class="etat etat-vote">A voté</span>
+                    : <span class={`etat etat-${m.statut}`}>{STATUTS_INSCRIPTION[m.statut]}</span>}
+                </td>
+                <td>
+                  {!m.utilise_le && (
+                    <div class="actions-membre">
+                      {m.statut !== "valide" && (
+                        <ActionMembre commun={p.commun} code={m.code} retour={p.retour} action="statut" statut="valide"
+                          classe="bouton bouton-petit" libelle="Valider" />
+                      )}
+                      {m.statut === "attente" && (
+                        <ActionMembre commun={p.commun} code={m.code} retour={p.retour} action="statut" statut="rejete"
+                          classe="lien lien-danger" libelle="Rejeter" />
+                      )}
+                      {m.statut === "valide" && m.telephone && (
+                        <a class="lien" href={m.whatsapp} target="_blank" rel="noopener">Envoyer sur WhatsApp</a>
+                      )}
+                      {m.statut === "valide" && (
+                        <ActionMembre commun={p.commun} code={m.code} retour={p.retour} action="nouveau" classe="lien"
+                          libelle="Nouveau code" confirmation="Remplacer ce code ? L'ancien ne fonctionnera plus." />
+                      )}
+                      {m.statut !== "attente" && (
+                        <ActionMembre commun={p.commun} code={m.code} retour={p.retour} action="supprimer" classe="lien lien-danger"
+                          libelle="Supprimer" confirmation="Supprimer ce membre et son code ?" />
+                      )}
+                    </div>
                   )}
                 </td>
               </tr>
@@ -266,6 +334,23 @@ export const Codes: FC<{
           </tbody>
         </table>
       </div>
+      <p class="aide"><a href="/admin/codes.csv">Exporter la liste (CSV)</a></p>
     </section>
+
+    {p.commun.statut !== "clos" && (
+      <section class="carte">
+        <h2>Ajouter des membres à la main</h2>
+        <p class="aide aide-section">Pour les membres qui ne peuvent pas s'inscrire eux-mêmes. Ces codes sont validés directement.</p>
+        <form method="post" action="/admin/codes/generer" class="formulaire">
+          <ChampCsrf commun={p.commun} />
+          <label for="membres">Membres <small>(un par ligne : Nom ; téléphone facultatif)</small></label>
+          <textarea id="membres" name="membres" rows={4}
+            placeholder={"Prénom NOM ; 06 12 34 56 78\nPrénom NOM ; +228 90 12 34 56"}></textarea>
+          <label for="nombre">Ou nombre de codes sans nom</label>
+          <input id="nombre" name="nombre" type="number" min="0" max="500" inputmode="numeric" placeholder="0" />
+          <button class="bouton">Générer</button>
+        </form>
+      </section>
+    )}
   </Page>
 );

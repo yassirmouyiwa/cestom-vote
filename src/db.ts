@@ -18,6 +18,9 @@ export type Statut = keyof typeof STATUTS;
 export const STATUTS_CANDIDATURE = { attente: "En attente", validee: "Validée", rejetee: "Rejetée" } as const;
 export type StatutCandidature = keyof typeof STATUTS_CANDIDATURE;
 
+export const STATUTS_INSCRIPTION = { attente: "À valider", valide: "Validé", rejete: "Rejeté" } as const;
+export type StatutInscription = keyof typeof STATUTS_INSCRIPTION;
+
 export const ESSAIS_MAX = 10;
 const FENETRE_ESSAIS = 15 * 60_000;
 
@@ -28,13 +31,17 @@ export interface Parametres {
   titre: string;
   statut: Statut;
   date_limite: string; // heure du Maroc, « AAAA-MM-JJTHH:MM »
+  whatsapp_comite: string; // numéro normalisé, facultatif
 }
 
 const PARAMETRES_DEFAUT: Parametres = {
   titre: "Élections du Bureau CESTOM Tétouan 2026-2027",
   statut: "preparation",
   date_limite: "2026-09-20T23:59",
+  whatsapp_comite: "",
 };
+
+const VERSION_SCHEMA = 2;
 
 const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS parametres (cle TEXT PRIMARY KEY, valeur TEXT NOT NULL)`,
@@ -54,7 +61,8 @@ const SCHEMA = [
      telephone TEXT NOT NULL DEFAULT '',
      cree_le TEXT NOT NULL,
      utilise_le TEXT,
-     marque TEXT)`,
+     marque TEXT,
+     statut TEXT NOT NULL DEFAULT 'valide')`,
   // Bulletins anonymes : aucune colonne ne renvoie au code utilisé, pas d'horodatage, et un
   // identifiant aléatoire en clé primaire (WITHOUT ROWID) : l'ordre d'arrivée n'est pas conservé.
   `CREATE TABLE IF NOT EXISTS voix (
@@ -65,23 +73,48 @@ const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS tentatives (ip TEXT NOT NULL, moment INTEGER NOT NULL)`,
 ];
 
-/** Paramètres de l'élection ; crée les tables à la première utilisation de la base. */
+// Modifications des bases créées par une version précédente du site.
+const MIGRATIONS: Record<number, string[]> = {
+  // v2 : les membres s'inscrivent eux-mêmes ; leur code est validé par le comité.
+  2: ["ALTER TABLE codes ADD COLUMN statut TEXT NOT NULL DEFAULT 'valide'"],
+};
+
+async function migrer(db: D1Database, depuis: number) {
+  for (let version = depuis + 1; version <= VERSION_SCHEMA; version++) {
+    for (const sql of MIGRATIONS[version] ?? []) {
+      try {
+        await db.prepare(sql).run();
+      } catch (erreur) {
+        // Une autre requête simultanée a déjà appliqué cette migration.
+        if (!String(erreur).includes("duplicate column")) throw erreur;
+      }
+    }
+  }
+  await definirParametre(db, "version_schema", String(VERSION_SCHEMA)).run();
+}
+
+/** Paramètres de l'élection ; crée ou met à jour les tables à la première utilisation. */
 export async function chargerParametres(db: D1Database, schemaCree = false): Promise<Parametres> {
+  let lignes: { cle: string; valeur: string }[];
   try {
-    const { results } = await db.prepare("SELECT cle, valeur FROM parametres").all<{ cle: string; valeur: string }>();
-    return { ...PARAMETRES_DEFAUT, ...Object.fromEntries(results.map((l) => [l.cle, l.valeur])) };
+    ({ results: lignes } = await db.prepare("SELECT cle, valeur FROM parametres").all<{ cle: string; valeur: string }>());
   } catch (erreur) {
     if (schemaCree || !String(erreur).includes("no such table")) throw erreur;
+    const valeurs = [...Object.entries(PARAMETRES_DEFAUT), ["version_schema", String(VERSION_SCHEMA)]];
     await db.batch([
       ...SCHEMA.map((sql) => db.prepare(sql)),
-      db.prepare("INSERT OR IGNORE INTO parametres (cle, valeur) VALUES (?, ?), (?, ?), (?, ?)")
-        .bind(...Object.entries(PARAMETRES_DEFAUT).flat()),
+      db.prepare(`INSERT OR IGNORE INTO parametres (cle, valeur) VALUES ${valeurs.map(() => "(?, ?)").join(", ")}`)
+        .bind(...valeurs.flat()),
     ]);
     return chargerParametres(db, true);
   }
+  const valeurs = Object.fromEntries(lignes.map((l) => [l.cle, l.valeur]));
+  const version = Number(valeurs.version_schema ?? 1);
+  if (version < VERSION_SCHEMA) await migrer(db, version);
+  return { ...PARAMETRES_DEFAUT, ...valeurs };
 }
 
-export function definirParametre(db: D1Database, cle: keyof Parametres, valeur: string) {
+export function definirParametre(db: D1Database, cle: keyof Parametres | "version_schema", valeur: string) {
   return db
     .prepare("INSERT INTO parametres (cle, valeur) VALUES (?, ?) ON CONFLICT(cle) DO UPDATE SET valeur = excluded.valeur")
     .bind(cle, valeur);
@@ -106,6 +139,26 @@ export function dateLimiteTexte(parametres: Parametres): string {
   return dateEnFrancais(heureMaroc(dateLimite(parametres)));
 }
 
+// --- Téléphones ----------------------------------------------------------------
+
+export const ERREUR_TELEPHONE =
+  "Indiquez un numéro WhatsApp complet : 06… / 07… pour le Maroc, sinon avec l'indicatif du pays (ex. : +228 90 12 34 56).";
+
+export function normaliserTelephone(saisie: string): string {
+  let chiffres = saisie.replace(/\D/g, "");
+  if (chiffres.startsWith("00")) {
+    chiffres = chiffres.slice(2);
+  } else if (chiffres.length === 10 && chiffres.startsWith("0")) {
+    chiffres = "212" + chiffres.slice(1); // numéro marocain local : 06… / 07…
+  }
+  return chiffres;
+}
+
+/** Numéro international, indicatif compris (11 à 15 chiffres), utilisable avec wa.me. */
+export function telephoneValide(telephone: string): boolean {
+  return telephone.length >= 11 && telephone.length <= 15;
+}
+
 // --- Codes de vote -----------------------------------------------------------
 
 export function nouveauCode(): string {
@@ -124,45 +177,70 @@ export function normaliserCode(saisie: string): string | null {
   return brut.length === 6 ? `${brut.slice(0, 3)}-${brut.slice(3)}` : null;
 }
 
-export function normaliserTelephone(saisie: string): string {
-  let chiffres = saisie.replace(/\D/g, "");
-  if (chiffres.startsWith("00")) {
-    chiffres = chiffres.slice(2);
-  } else if (chiffres.length === 10 && chiffres.startsWith("0")) {
-    chiffres = "212" + chiffres.slice(1); // numéro marocain local : 06… / 07…
-  }
-  return chiffres;
-}
+const collisionDeCode = (erreur: unknown) => String(erreur).includes("UNIQUE");
 
-/** Crée un code par membre [nom, téléphone], en une seule transaction. */
+/** Crée des codes déjà validés, un par membre [nom, téléphone], en une seule transaction. */
 export async function creerCodes(db: D1Database, membres: [string, string][]) {
   const codes = new Set<string>();
   while (codes.size < membres.length) codes.add(nouveauCode());
   const maintenant = new Date().toISOString();
-  const lignes = [...codes].map((code, i) => [code, membres[i][0], membres[i][1], maintenant]);
+  const lignes = [...codes].map((code, i) => [code, membres[i][0], membres[i][1], maintenant, "valide"]);
   const requetes = [];
-  for (let i = 0; i < lignes.length; i += 25) { // 100 paramètres au plus par requête
-    const lot = lignes.slice(i, i + 25);
+  for (let i = 0; i < lignes.length; i += 20) { // 100 paramètres au plus par requête
+    const lot = lignes.slice(i, i + 20);
     requetes.push(
-      db.prepare(`INSERT INTO codes (code, membre, telephone, cree_le) VALUES ${lot.map(() => "(?, ?, ?, ?)").join(", ")}`)
+      db.prepare(`INSERT INTO codes (code, membre, telephone, cree_le, statut) VALUES ${lot.map(() => "(?, ?, ?, ?, ?)").join(", ")}`)
         .bind(...lot.flat()),
     );
   }
   await db.batch(requetes);
 }
 
+/** Inscrit un membre (code à valider par le comité) ; null si ce numéro est déjà inscrit. */
+export async function inscrireMembre(db: D1Database, nom: string, telephone: string): Promise<string | null> {
+  for (let essai = 1; ; essai++) {
+    const code = nouveauCode();
+    try {
+      // Vérification du numéro et insertion dans la même requête : pas de doublon possible.
+      const { meta } = await db.prepare(
+        `INSERT INTO codes (code, membre, telephone, cree_le, statut)
+         SELECT ?, ?, ?, ?, 'attente'
+         WHERE NOT EXISTS (SELECT 1 FROM codes WHERE telephone = ? AND statut != 'rejete')`,
+      ).bind(code, nom, telephone, new Date().toISOString(), telephone).run();
+      return meta.changes === 1 ? code : null;
+    } catch (erreur) {
+      if (essai >= 3 || !collisionDeCode(erreur)) throw erreur;
+    }
+  }
+}
+
+/** Remplace un code encore inutilisé (code perdu ou divulgué) ; null s'il a déjà servi. */
+export async function remplacerCode(db: D1Database, ancien: string): Promise<string | null> {
+  for (let essai = 1; ; essai++) {
+    const nouveau = nouveauCode();
+    try {
+      const { meta } = await db
+        .prepare("UPDATE codes SET code = ? WHERE code = ? AND utilise_le IS NULL")
+        .bind(nouveau, ancien).run();
+      return meta.changes === 1 ? nouveau : null;
+    } catch (erreur) {
+      if (essai >= 3 || !collisionDeCode(erreur)) throw erreur;
+    }
+  }
+}
+
 // --- Limitation des essais ---------------------------------------------------
 
-export async function essaisBloques(db: D1Database, ip: string): Promise<boolean> {
+export async function essaisBloques(db: D1Database, cle: string): Promise<boolean> {
   const [, compte] = await db.batch<{ n: number }>([
     db.prepare("DELETE FROM tentatives WHERE moment < ?").bind(Date.now() - FENETRE_ESSAIS),
-    db.prepare("SELECT COUNT(*) AS n FROM tentatives WHERE ip = ?").bind(ip),
+    db.prepare("SELECT COUNT(*) AS n FROM tentatives WHERE ip = ?").bind(cle),
   ]);
   return compte.results[0].n >= ESSAIS_MAX;
 }
 
-export function noterEchec(db: D1Database, ip: string) {
-  return db.prepare("INSERT INTO tentatives (ip, moment) VALUES (?, ?)").bind(ip, Date.now()).run();
+export function noterTentative(db: D1Database, cle: string) {
+  return db.prepare("INSERT INTO tentatives (ip, moment) VALUES (?, ?)").bind(cle, Date.now()).run();
 }
 
 // --- Candidats, vote et résultats --------------------------------------------
@@ -204,15 +282,19 @@ export async function nombreEnAttente(db: D1Database): Promise<number> {
   return (await db.prepare("SELECT COUNT(*) AS n FROM candidats WHERE statut = 'attente'").first<number>("n")) ?? 0;
 }
 
+/** Membres validés (inscrits), votants et inscriptions à valider. */
 export async function participation(db: D1Database) {
-  const ligne = await db
-    .prepare("SELECT COUNT(*) AS inscrits, COUNT(utilise_le) AS votants FROM codes")
-    .first<{ inscrits: number; votants: number }>();
-  const { inscrits, votants } = ligne ?? { inscrits: 0, votants: 0 };
-  return { inscrits, votants, taux: inscrits ? Math.round((votants * 1000) / inscrits) / 10 : 0 };
+  const ligne = await db.prepare(
+    `SELECT COUNT(CASE WHEN statut = 'valide' THEN 1 END) AS inscrits,
+            COUNT(utilise_le) AS votants,
+            COUNT(CASE WHEN statut = 'attente' THEN 1 END) AS enAttente
+     FROM codes`,
+  ).first<{ inscrits: number; votants: number; enAttente: number }>();
+  const { inscrits, votants, enAttente } = ligne ?? { inscrits: 0, votants: 0, enAttente: 0 };
+  return { inscrits, votants, enAttente, taux: inscrits ? Math.round((votants * 1000) / inscrits) / 10 : 0 };
 }
 
-/** Enregistre un bulletin si le code est encore valable et le vote ouvert : tout ou rien. */
+/** Enregistre un bulletin si le code est validé, encore libre et le vote ouvert : tout ou rien. */
 export async function enregistrerVote(db: D1Database, code: string, choix: [string, number | null][]) {
   if (choix.length === 0) return false;
   // La marque aléatoire relie, le temps de la transaction, l'insertion des voix au
@@ -222,7 +304,7 @@ export async function enregistrerVote(db: D1Database, code: string, choix: [stri
   const [marquage] = await db.batch([
     db.prepare(
       `UPDATE codes SET utilise_le = ?, marque = ?
-       WHERE code = ? AND utilise_le IS NULL
+       WHERE code = ? AND utilise_le IS NULL AND statut = 'valide'
          AND (SELECT valeur FROM parametres WHERE cle = 'statut') = 'ouvert'`,
     ).bind(new Date().toISOString(), marque, code),
     db.prepare(
